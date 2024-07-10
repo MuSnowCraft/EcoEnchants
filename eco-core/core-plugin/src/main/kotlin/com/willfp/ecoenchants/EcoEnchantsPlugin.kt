@@ -1,8 +1,10 @@
 package com.willfp.ecoenchants
 
+import com.willfp.eco.core.Prerequisite
 import com.willfp.eco.core.command.impl.PluginCommand
 import com.willfp.eco.core.display.DisplayModule
 import com.willfp.eco.core.integrations.IntegrationLoader
+import com.willfp.eco.core.packet.PacketListener
 import com.willfp.ecoenchants.commands.CommandEcoEnchants
 import com.willfp.ecoenchants.commands.CommandEnchant
 import com.willfp.ecoenchants.commands.CommandEnchantInfo
@@ -13,12 +15,14 @@ import com.willfp.ecoenchants.config.VanillaEnchantsYml
 import com.willfp.ecoenchants.display.DisplayCache
 import com.willfp.ecoenchants.display.EnchantDisplay
 import com.willfp.ecoenchants.display.EnchantSorter
-import com.willfp.ecoenchants.enchants.EcoEnchantLevel
-import com.willfp.ecoenchants.enchants.EcoEnchants
-import com.willfp.ecoenchants.enchants.EnchantGUI
-import com.willfp.ecoenchants.enchants.FoundEcoEnchantLevel
-import com.willfp.ecoenchants.enchants.LoreConversion
-import com.willfp.ecoenchants.enchants.registerVanillaEnchants
+import com.willfp.ecoenchants.enchant.EcoEnchantLevel
+import com.willfp.ecoenchants.enchant.EcoEnchants
+import com.willfp.ecoenchants.enchant.EnchantGUI
+import com.willfp.ecoenchants.enchant.LoreConversion
+import com.willfp.ecoenchants.enchant.legacyRegisterVanillaEnchantmentData
+import com.willfp.ecoenchants.enchant.registration.EnchantmentRegisterer
+import com.willfp.ecoenchants.enchant.registration.legacy.LegacyEnchantmentRegisterer
+import com.willfp.ecoenchants.enchant.registration.modern.ModernEnchantmentRegistererProxy
 import com.willfp.ecoenchants.integrations.EnchantRegistrations
 import com.willfp.ecoenchants.integrations.plugins.CMIIntegration
 import com.willfp.ecoenchants.integrations.plugins.EssentialsIntegration
@@ -28,19 +32,20 @@ import com.willfp.ecoenchants.mechanics.ExtraItemSupport
 import com.willfp.ecoenchants.mechanics.GrindstoneSupport
 import com.willfp.ecoenchants.mechanics.LootSupport
 import com.willfp.ecoenchants.mechanics.VillagerSupport
-import com.willfp.ecoenchants.target.EnchantLookup.clearEnchantCache
-import com.willfp.ecoenchants.target.EnchantLookup.getActiveEnchantLevel
-import com.willfp.ecoenchants.target.EnchantLookup.heldEnchantLevels
-import com.willfp.libreforge.EmptyProvidedHolder.holder
+import com.willfp.ecoenchants.target.EnchantFinder
+import com.willfp.ecoenchants.target.EnchantFinder.clearEnchantmentCache
 import com.willfp.libreforge.NamedValue
-import com.willfp.libreforge.ProvidedHolder
 import com.willfp.libreforge.loader.LibreforgePlugin
 import com.willfp.libreforge.loader.configs.ConfigCategory
 import com.willfp.libreforge.registerHolderPlaceholderProvider
 import com.willfp.libreforge.registerHolderProvider
-import com.willfp.libreforge.registerPlayerRefreshFunction
-import org.bukkit.entity.Player
+import com.willfp.libreforge.registerSpecificRefreshFunction
+import org.bukkit.Bukkit
+import org.bukkit.entity.LivingEntity
 import org.bukkit.event.Listener
+
+internal lateinit var plugin: EcoEnchantsPlugin
+    private set
 
 class EcoEnchantsPlugin : LibreforgePlugin() {
     val targetsYml = TargetsYml(this)
@@ -50,8 +55,18 @@ class EcoEnchantsPlugin : LibreforgePlugin() {
     var isLoaded = false
         private set
 
+    val enchantmentRegisterer: EnchantmentRegisterer = if (Prerequisite.HAS_1_20_3.isMet) {
+        this.getProxy(ModernEnchantmentRegistererProxy::class.java)
+    } else {
+        LegacyEnchantmentRegisterer
+    }
+
     init {
-        instance = this
+        plugin = this
+
+        if (Prerequisite.HAS_1_20_3.isMet) {
+            plugin.getProxy(ModernEnchantmentRegistererProxy::class.java).replaceRegistry()
+        }
     }
 
     override fun loadConfigCategories(): List<ConfigCategory> {
@@ -61,14 +76,10 @@ class EcoEnchantsPlugin : LibreforgePlugin() {
     }
 
     override fun handleEnable() {
-        registerHolderProvider { it.heldEnchantLevels }
-        registerPlayerRefreshFunction { it.clearEnchantCache() }
+        registerHolderProvider(EnchantFinder.toHolderProvider())
 
-        registerHolderPlaceholderProvider<FoundEcoEnchantLevel> { it, _ ->
-            listOf(
-                NamedValue("level", it.level.level),
-                NamedValue("active_level", it.activeLevel)
-            )
+        registerSpecificRefreshFunction<LivingEntity> {
+            it.clearEnchantmentCache()
         }
 
         registerHolderPlaceholderProvider<EcoEnchantLevel> { it, _ ->
@@ -80,10 +91,24 @@ class EcoEnchantsPlugin : LibreforgePlugin() {
 
     override fun handleAfterLoad() {
         isLoaded = true
+
+        if (Prerequisite.HAS_1_21.isMet) {
+            plugin.getProxy(ModernEnchantmentRegistererProxy::class.java).replaceRegistry()
+        }
+
+        // Run in afterLoad to prevent items from having their enchantments deleted
+        if (Prerequisite.HAS_1_20_5.isMet && !Prerequisite.HAS_1_21.isMet) {
+                Bukkit.getPluginManager().disablePlugin(this)
+
+                throw IllegalStateException("EcoEnchants does not support 1.20.6. Please update your server " +
+                        "or downgrade to 1.20.4.")
+        }
     }
 
     override fun handleReload() {
-        registerVanillaEnchants(this)
+        if (!Prerequisite.HAS_1_20_3.isMet) {
+            legacyRegisterVanillaEnchantmentData(this)
+        }
 
         DisplayCache.reload()
         EnchantSorter.reload(this)
@@ -121,12 +146,5 @@ class EcoEnchantsPlugin : LibreforgePlugin() {
         return if (configYml.getBool("display.enabled")) {
             EnchantDisplay(this)
         } else null
-    }
-
-    companion object {
-        /** Instance of EcoEnchants. */
-        @JvmStatic
-        lateinit var instance: EcoEnchantsPlugin
-            private set
     }
 }
